@@ -1,0 +1,9 @@
+{
+  "name": "strobes-agents-mcp",
+  "version": "0.1.0",
+  "description": "Drive Strobes AI workspaces & agents from Claude Code — spin up/stop agent tasks, chat with agents, manage workspaces (public GraphQL API).",
+  "author": { "name": "Strobes" },
+  "homepage": "https://strobes.co",
+  "keywords": ["strobes", "ai agents", "pentest", "workspaces", "automation", "security"],
+  "mcpServers": "./.mcp.json"
+}

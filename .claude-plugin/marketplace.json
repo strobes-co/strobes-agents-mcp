@@ -1,0 +1,12 @@
+{
+  "name": "strobes-agents",
+  "owner": { "name": "Strobes" },
+  "metadata": { "description": "Strobes AI workspaces & agents MCP plugin for Claude Code." },
+  "plugins": [
+    {
+      "name": "strobes-agents-mcp",
+      "source": "./",
+      "description": "AI workspaces & agent control over the Strobes public API."
+    }
+  ]
+}

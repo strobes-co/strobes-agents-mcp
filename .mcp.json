@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "strobes-agents": {
+      "command": "uv",
+      "args": ["run", "--directory", "${CLAUDE_PLUGIN_ROOT}", "strobes-agents-mcp"],
+      "env": {
+        "STROBES_HOST": "${STROBES_HOST}",
+        "STROBES_API_TOKEN": "${STROBES_API_TOKEN}",
+        "STROBES_ORGANIZATION_ID": "${STROBES_ORGANIZATION_ID}",
+        "STROBES_BASE_URL": "${STROBES_BASE_URL}",
+        "STROBES_TENANT_HOST": "${STROBES_TENANT_HOST}",
+        "STROBES_VERIFY_TLS": "${STROBES_VERIFY_TLS}"
+      }
+    }
+  }
+}
