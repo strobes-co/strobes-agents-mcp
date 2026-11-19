@@ -1,0 +1,26 @@
+# Tag vX.Y.Z → build → publish to PyPI (trusted publishing; configure the
+# "pypi" environment + publisher on pypi.org first) → MCP Registry.
+name: Release
+on:
+  push: { tags: ["v*"] }
+jobs:
+  pypi:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions: { id-token: write, contents: read }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv build
+      - uses: pypa/gh-action-pypi-publish@release/v1
+  mcp-registry:
+    needs: pypi
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish server.json to the MCP Registry
+        run: |
+          curl -sL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish
