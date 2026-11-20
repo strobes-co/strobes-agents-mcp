@@ -288,10 +288,13 @@ async def _poll_login_forever(login: auth.DeviceLogin) -> None:
 async def strobes_login(
     ctx: Context,
     url: Annotated[Optional[str], Field(
-        description="Strobes URL, e.g. https://acme.strobes.co. Defaults to the last "
-                    "URL used, else https://app.strobes.co (org is picked in the browser).")] = None,
+        description="Strobes URL, e.g. https://acme.strobes.co. Defaults to the URL you're "
+                    "signed in to, else https://app.strobes.co (org is picked in the browser).")] = None,
     profile: Annotated[Optional[str], Field(
         description="Profile name to save the sign-in under (default: current profile).")] = None,
+    web_url: Annotated[Optional[str], Field(
+        description="Web app URL for the approval page if it differs from the API host "
+                    "(local dev only, e.g. http://localhost:3000).")] = None,
     open_browser: Annotated[bool, Field(
         description="Open the sign-in page in the local browser.")] = True,
 ) -> dict[str, Any]:
@@ -307,8 +310,10 @@ async def strobes_login(
     name = profile or current.name
     if SESSION.login_task and not SESSION.login_task.done():
         SESSION.login_task.cancel()
-    login = await auth.start_login(url or current.login_url or None, profile=name,
-                                   verify_tls=current.verify_tls,
+    fallback = current if current.base_url else resolve_profile(SESSION.profile_override)
+    default_url = current.login_url or (fallback.web_url if fallback.base_url else None)
+    login = await auth.start_login(url or default_url, profile=name,
+                                   verify_tls=fallback.verify_tls, web_url=web_url,
                                    launch_browser=open_browser)
     SESSION.login = login
     SESSION.login_task = asyncio.create_task(_poll_login_forever(login))
@@ -477,7 +482,7 @@ async def get_workspace(ctx: Context, workspace_id: WorkspaceId = None) -> dict[
     if not w:
         raise ToolError("Workspace not found.")
     out = render.workspace(w)
-    out["web_url"] = f"{api.profile.web_url}/pulse/workspaces/{w['id']}"
+    out["web_url"] = api.profile.app_url(f"ai/workspaces/{w['id']}")
     return out
 
 
@@ -521,7 +526,7 @@ async def create_workspace(
     w = render.workspace(p.get("workspace"))
     if activate and w.get("id") and w.get("status") != "active":
         w["status"] = await _activate(api, w["id"])
-    w["web_url"] = f"{api.profile.web_url}/pulse/workspaces/{w.get('id')}"
+    w["web_url"] = api.profile.app_url(f"ai/workspaces/{w.get('id')}")
     return w
 
 
@@ -979,7 +984,7 @@ async def list_approvals(
     rows = await api.rest("GET", f"cli/workspaces/{ws}/approvals/",
                           params={"state": state, "limit": limit}) or []
     return {"approvals": [render.compact(r) for r in rows], "count": len(rows),
-            "web_url": f"{api.profile.web_url}/pulse/workspaces/{ws}"}
+            "web_url": api.profile.app_url(f"ai/workspaces/{ws}")}
 
 
 @tool(RO, "AI credit usage")
@@ -1040,7 +1045,7 @@ async def start_workflow(
     w = render.workspace(p.get("workspace"))
     if activate and w.get("id") and w.get("status") != "active":
         w["status"] = await _activate(api, w["id"])
-    w["web_url"] = f"{api.profile.web_url}/pulse/workspaces/{w.get('id')}"
+    w["web_url"] = api.profile.app_url(f"ai/workspaces/{w.get('id')}")
     w["next_step"] = ("Workflow starting — call get_workflow for phase progress." if activate
                       else "Finish workspace setup in the web app (web_url) to start the workflow.")
     return w

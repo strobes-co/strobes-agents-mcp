@@ -223,14 +223,25 @@ def install(client: str, cmd: list[str], env: dict[str, str], scope: str,
 # --------------------------------------------------------------------------
 def cmd_login(a: argparse.Namespace) -> int:
     from .auth import LoginError, start_login, wait_for_login
-    from .config import resolve_profile
+    from .config import DEFAULT_LOGIN_URL, resolve_profile
 
     current = resolve_profile(a.profile)
+    # default: the URL last used to sign in, else the tenant this profile (or the
+    # current one, for a new profile) already talks to, else app.strobes.co
+    fallback = current if current.base_url else resolve_profile()
+    default_url = (current.login_url or (fallback.web_url if fallback.base_url else None)
+                   or DEFAULT_LOGIN_URL)
+    url = a.url
+    if not url and sys.stdin.isatty():
+        typed = input(f"Strobes URL [{default_url}]: ").strip()
+        url = typed or default_url
+    url = url or default_url
 
     async def run() -> int:
         try:
-            login = await start_login(a.url or current.login_url, profile=current.name,
-                                      verify_tls=not a.insecure and current.verify_tls,
+            login = await start_login(url, profile=current.name,
+                                      verify_tls=not a.insecure and fallback.verify_tls,
+                                      web_url=a.web_url,
                                       launch_browser=not a.no_browser)
         except LoginError as e:
             _err(str(e))
@@ -417,7 +428,7 @@ def cmd_setup(a: argparse.Namespace) -> int:
         return 2
     if not resolve_profile(a.profile).complete:
         print("Step 1 — sign in to Strobes")
-        rc = cmd_login(argparse.Namespace(url=a.url, profile=a.profile,
+        rc = cmd_login(argparse.Namespace(url=a.url, web_url=None, profile=a.profile,
                                           no_browser=a.no_browser, insecure=False))
         if rc:
             return rc
@@ -509,7 +520,11 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_serve)
 
     s = sub.add_parser("login", help="Sign in through the browser.")
-    s.add_argument("--url", help="Strobes URL (default: last used, else https://app.strobes.co).")
+    s.add_argument("--url", help="Strobes (API) URL. Default: the last one used / the tenant "
+                                 "you're signed in to, else https://app.strobes.co.")
+    s.add_argument("--web-url", help="Web app URL for the approval page, when it's on a "
+                                     "different host than the API (local dev, e.g. "
+                                     "http://localhost:3000). Also: STROBES_WEB_URL.")
     s.add_argument("--profile", help="Save under this profile name.")
     s.add_argument("--no-browser", action="store_true", help="Just print the link.")
     s.add_argument("--insecure", action="store_true", help="Skip TLS verification (dev only).")

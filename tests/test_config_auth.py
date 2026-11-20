@@ -179,7 +179,7 @@ async def test_device_flow_denied(isolated):
 @respx.mock
 async def test_device_flow_unsupported_server(isolated):
     respx.post(START).respond(404)
-    with pytest.raises(auth.LoginError, match="doesn't support browser sign-in"):
+    with pytest.raises(auth.LoginError, match="no browser sign-in endpoint"):
         await auth.start_login(None, launch_browser=False)
 
 

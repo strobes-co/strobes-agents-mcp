@@ -121,11 +121,16 @@ async def start_login(url: str | None = None, *, profile: str = "default",
             r = await http.post(f"{api}/cli/auth/device/",
                                 json={"client_name": client_name(harness)})
         except httpx.HTTPError as e:
-            raise LoginError(f"Couldn't reach {url}: {e}") from e
+            raise LoginError(f"Couldn't reach {api}/cli/auth/device/: "
+                             f"{type(e).__name__}: {e or repr(e)}") from e
     if r.status_code == 404:
-        raise LoginError(f"{url} doesn't support browser sign-in yet. Set "
-                         "STROBES_URL, STROBES_ORGANIZATION_ID and STROBES_API_KEY "
-                         "(a MasterKey from Settings → API access) instead.")
+        raise LoginError(
+            f"{url} has no browser sign-in endpoint ({api}/cli/auth/device/ → 404). Either "
+            "this Strobes server is older than the feature, or the URL is the web app rather "
+            "than the API — then pass the API with --url and the web app with --web-url "
+            "(e.g. --url http://acme.local --web-url http://localhost:3000). Otherwise set "
+            "STROBES_URL, STROBES_ORGANIZATION_ID and STROBES_API_KEY (a MasterKey from "
+            "Settings → API access).")
     if r.status_code >= 400:
         raise LoginError(f"Couldn't start sign-in at {url} (HTTP {r.status_code}).")
     body = r.json()

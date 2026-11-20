@@ -112,15 +112,12 @@ class StrobesAPI:
             raise StrobesError(f"Strobes returned a non-JSON response for {op}: "
                                f"{r.text[:200]}") from e
         errors = body.get("errors") or []
-        if errors and not body.get("data"):
-            raise StrobesError(_gql_message(errors, op))
         if errors:
-            # partial data: surface errors but keep what came back
-            log.warning("partial GraphQL errors for %s: %s", op, errors)
-        data = body.get("data") or {}
-        if errors and all(v is None for v in data.values()):
+            # Never return partial data: a failed field often comes back as an
+            # empty-looking wrapper (e.g. {"objects": null}), which would read as
+            # "no findings" instead of "the query failed".
             raise StrobesError(_gql_message(errors, op))
-        return data
+        return body.get("data") or {}
 
     async def _send_gql(self, query: str, variables: dict[str, Any],
                         is_mutation: bool, timeout: float | None = None) -> httpx.Response:

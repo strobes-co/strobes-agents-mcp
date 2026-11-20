@@ -226,6 +226,11 @@ class Profile:
     def host(self) -> str:
         return urlparse(normalize_url(self.base_url)).hostname or ""
 
+    def app_url(self, path: str) -> str:
+        """Deep link into the web app, e.g. app_url("findings/42")."""
+        app = os.getenv("STROBES_WEB_APP", "ctem")
+        return f"{self.web_url}/organizations/{self.org_id}/apps/{app}/{path.lstrip('/')}"
+
     def redacted(self) -> dict[str, Any]:
         return {
             "profile": self.name,
