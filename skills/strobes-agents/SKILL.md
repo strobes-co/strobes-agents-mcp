@@ -1,57 +1,60 @@
 ---
 name: strobes-agents
-description: Drive Strobes AI workspaces and agents via the Strobes Agents MCP server. Use when the user wants to manage AI workspaces, spin up or stop Strobes agent tasks, read a task's conversation/output, read what agents produced (findings/assets/files), or run and control workflows (start from template, pause/resume/cancel). Triggers on "spin up an agent", "run a pentest agent/workflow", "stop that task", "create a workspace", "show the task's messages", "show workspace findings/files", "pull the report file", "pause the workflow".
+description: Drive Strobes AI agents through the strobes-agents MCP server — sign in, spin up or stop agent tasks (pentest, recon, triage, cloud, reporting …) and follow them to a result, read what agents produced (findings, assets, files), upload scope docs, and run or control multi-phase workflows. Use when the user says things like "have a Strobes agent test X", "spin up a pentest agent", "run the web app pentest workflow on X", "what are my agents doing", "stop that task", "show the workspace findings", "pull the report", "upload this scope doc", or "sign in to Strobes".
 ---
 
-# Strobes AI workspaces & agents
+# Strobes AI agents
 
-Drives the `strobes-agents` MCP server, wrapping the Strobes **public** GraphQL
-API (MasterKey auth). Companion skill `strobes` handles assets/findings/engagements.
+Tools come from the `strobes-agents` MCP server. Everything runs in Strobes' cloud;
+this side only starts work and reads results.
+
+## Sign-in (no API key to paste)
+1. `strobes_whoami` — if `signed_in` is false:
+2. `strobes_login(url?)` → show the user `verification_url` (clickable) and `user_code`;
+   they confirm the code, pick an organization (and optionally a default workspace) and
+   click Authorize.
+3. `strobes_login_status(wait_seconds=120)` until `approved`.
+The login is shared with the Strobes CLI (`strobes login`); `strobes_use_profile`
+switches between signed-in organizations.
 
 ## Concepts
-- **Workspace** — container for agent work (tasks, files, findings, assets). Must
-  be `ACTIVE` before you can create tasks in it.
-- **Agent** — a system/custom AI agent (e.g. `web_pentest_agent`,
-  `vuln_triage_agent`, `report_writer_agent`, `general_security_assistant`).
-- **Task** — a unit of agent work. You spin it up with instructions + an agent;
-  it runs async, holds a **conversation** (its messages) and produces output.
-- **Workflow** — a multi-phase agent pipeline started from a template.
+- **Workspace** — container for agent work: tasks, files, findings, assets. Must be
+  `active` to take tasks (`create_workspace` activates by default; `activate_workspace`
+  fixes an `initializing` one).
+- **Agent** — e.g. `web_pentest_agent`, `api_pentest_agent`, `aws_pentest_agent`,
+  `vuln_triage_agent`, `report_writer_agent`, `general_security_assistant`. Get the real
+  list from `list_agents`.
+- **Task** — one unit of agent work, created with natural-language instructions. It is
+  the only way to "talk" to an agent; its conversation is `get_task_messages`.
+- **Workflow** — a multi-phase pipeline of tasks from a template (`start_workflow`).
 
-> Tasks are the single interaction model: there is no separate "chat". To talk
-> to an agent, create a task; to read the exchange, use `get_task_messages`.
-
-## First call
-`strobes_agents_whoami` (connectivity), then `list_agents` for valid agent ids.
+`workspace_id` is optional everywhere: it defaults to the workspace picked at sign-in.
 
 ## Flows
-**Spin up agent work & follow it**
-1. `list_workspaces(status="active")` → a workspace id (or `create_workspace`).
-2. `list_agents()` → an `agent_type` id.
-3. `create_workspace_task(workspace_id, title, instructions, agent_type)` — queues it.
-4. Poll `list_workspace_tasks` for status; `get_task_messages(workspace_id, task_id)`
-   to read the agent's conversation/output (paginated, newest page first).
-5. `cancel_workspace_task` to stop, `retry_workspace_task` to re-run.
-
-**See what agents produced**
-- `list_workspace_findings` / `list_workspace_assets`
-- `list_workspace_files(workspace_id, path="", recursive=True)` to browse output
-- `get_workspace_file(workspace_id, path)` to pull one file (inlines small text;
-  always returns a `download_url`)
-- `download_workspace(workspace_id)` for a zip URL of everything
+**Get an agent to do something**
+1. `list_agents(search=...)` → agent id. Reuse a workspace (`list_workspaces(status="active")`)
+   or `create_workspace(name)`. Upload context first if useful: `upload_file(path="docs/scope.md", content=...)`.
+2. `create_task(instructions, agent, workspace_id)` — write instructions like a brief to a
+   pentester: target(s), scope boundaries, credentials to use, what to deliver.
+3. `wait_for_task(task_id)` — blocks with progress up to `timeout_seconds`; call again
+   while `status` is still running. The response carries the agent's `result`.
+4. Evidence: `list_findings` (filter `severity=["critical","high"]`), `list_files` →
+   `read_file`, `get_download_url` for big/binary files or a zip.
+5. `cancel_task` to stop, `retry_task` to re-run a failed one.
 
 **Run a workflow**
-1. `list_workflow_templates()` → a `slug` and its `required_variables`.
-2. `start_workflow(template_slug, variables, name=...)` — creates a workspace and
-   kicks off the pipeline.
-3. `get_workspace_workflow(workspace_id)` for status/phases; `pause_workflow` /
-   `resume_workflow` / `cancel_workflow` to control it.
+`list_workflow_templates` → `start_workflow(template_slug, variables={"target": ...})` →
+`get_workflow(workspace_id)` for phase progress → `control_workflow(action=pause|resume|cancel)`.
+
+**Status board** — `get_workspace` (stats), `list_tasks` (`by_status` counts),
+`get_workflow`, `list_approvals` (pending human approvals happen in the web app),
+`get_credit_usage`.
 
 ## Guidance
-- Workspace/task ids are **UUIDs**; agent ids are **strings**.
-- `create_workspace_task` returns immediately and runs **asynchronously** — poll
-  `list_workspace_tasks` / `get_task_messages`, don't expect output in the same call.
-- `get_task_messages` returns `[]` until the task's run has started.
-- Agent runs consume AI credits; a cap returns a clear `{"error": ...}`
-  (BUDGET_EXCEEDED) — surface it, don't retry blindly.
-- Creating a task needs an **ACTIVE** workspace; `initializing` will error.
-- Tools return `{"error": "..."}` on failure — read and adapt.
+- Tasks are asynchronous and cost AI credits — never create duplicates "to check"; use
+  `get_task` / `wait_for_task`. Don't blindly retry budget/credit failures; tell the user.
+- `get_task_messages` hides agent reasoning by default; pass `include_thinking=true` only
+  when the user wants it. Page older history with `offset=older_offset`.
+- Stay inside the scope the user gave. Confirm before archiving workspaces, cancelling
+  workflows, or launching work against targets the user hasn't named.
+- Errors come back as tool errors with a next step (e.g. sign in again) — follow it.

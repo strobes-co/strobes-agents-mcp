@@ -1,0 +1,23 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
+  "name": "io.github.strobes-co/strobes-agents-mcp",
+  "title": "Strobes AI Agents",
+  "description": "Spin up Strobes AI security agents, follow them to a result, read findings & files, run workflows.",
+  "version": "0.2.0",
+  "websiteUrl": "https://strobes.co",
+  "repository": { "url": "https://github.com/strobes-co/strobes-agents-mcp", "source": "github" },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "strobes-agents-mcp",
+      "version": "0.2.0",
+      "transport": { "type": "stdio" },
+      "environmentVariables": [
+        { "name": "STROBES_URL", "description": "Tenant URL (optional — browser sign-in sets it)", "isRequired": false },
+        { "name": "STROBES_API_KEY", "description": "MasterKey (optional — use browser sign-in instead)", "isRequired": false, "isSecret": true },
+        { "name": "STROBES_ORGANIZATION_ID", "description": "Organization UUID (optional with browser sign-in)", "isRequired": false },
+        { "name": "STROBES_PROFILE", "description": "Stored profile to use", "isRequired": false }
+      ]
+    }
+  ]
+}
