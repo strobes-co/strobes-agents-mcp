@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, Optional
 
 import httpx
+import yaml
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
@@ -46,6 +47,8 @@ id from `list_agents`; tasks run asynchronously in Strobes' cloud — use
 land in the workspace: `list_findings`, `list_assets`, `list_files`/`read_file`.
 For a multi-phase pipeline, `list_workflow_templates` then `start_workflow`; follow it
 live with `wait_for_workflow` (returns on phase changes and when a person is needed).
+To write one: `workflow_authoring_catalog`, `export_workflow_template`, then
+`validate_workflow_spec` → `save_workflow_template` / `attach_workflow`.
 
 `workspace_id` defaults to the workspace chosen at sign-in, when there is one.
 Agent runs consume AI credits — don't create duplicate tasks, and don't retry a
@@ -1241,7 +1244,8 @@ async def control_workflow(
     action: Annotated[Literal["pause", "resume", "cancel", "restart", "restart_phase", "advance"],
                       Field(description=(
         "pause: hold after running tasks; resume: continue; cancel: stop for good; "
-        "restart: re-run a finished/failed/cancelled workflow from scratch (credits); "
+        "restart: re-run a finished/failed/cancelled workflow from scratch, or start a "
+        "pending (just-edited) one (credits); "
         "restart_phase: re-run one phase (needs phase_key; credits); "
         "advance: move past a manual gate phase."))],
     workspace_id: WorkspaceId = None,
@@ -1265,6 +1269,373 @@ async def control_workflow(
     if out["ok"] and action not in ("pause", "cancel"):
         out["next_step"] = "Call wait_for_workflow to follow it."
     return out
+
+
+# --------------------------------------------------------------------------
+# workflow authoring
+# --------------------------------------------------------------------------
+SpecArg = Annotated[Optional[dict[str, Any]], Field(description=(
+    "Workflow spec: {name, description?, icon?, required_variables?: [names], "
+    "table_templates?: [...], phases: [{key, name, gate_type?, failure_policy?, "
+    "loop_config?, tasks: [{key, title, instructions, agent_type, kind?, ...}]}]}. "
+    "Use {variable} placeholders (e.g. {target}) in titles/instructions. See "
+    "workflow_authoring_catalog for valid agents, gate types and policies."))]
+SpecPathArg = Annotated[Optional[str], Field(description=(
+    "Instead of `spec`: a local .json / .yaml file holding the spec (e.g. one written "
+    "by export_workflow_template(save_to=...)). Local (stdio) server only."))]
+SPEC_FILE_TYPES = (".json", ".yaml", ".yml")
+
+
+def _project_path(path: str, *, verb: str) -> Path:
+    """A spec file path inside the project roots, never a hidden/secret file."""
+    from .config import config_dir
+
+    p = Path(path).expanduser().resolve()
+    roots = [Path(r).expanduser().resolve() for r in
+             os.getenv("STROBES_MCP_UPLOAD_ROOTS", "").split(os.pathsep) if r.strip()]
+    roots = roots or [Path.cwd().resolve()]
+    if not any(p.is_relative_to(r) for r in roots) or roots == [Path(p.anchor)]:
+        raise ToolError(f"Refusing to {verb} {p}: spec files must be under "
+                        f"{', '.join(map(str, roots))}. Set STROBES_MCP_UPLOAD_ROOTS to allow "
+                        "other folders, or pass `spec` inline.")
+    if (p.suffix.lower() not in SPEC_FILE_TYPES or p.is_relative_to(config_dir().resolve())
+            or any(part.startswith(".") for part in p.parts[1:])):
+        raise ToolError(f"Refusing to {verb} {p}: use a visible .json / .yaml / .yml file.")
+    return p
+
+
+def _load_spec(ctx: Context, spec: dict[str, Any] | None, spec_path: str | None) -> dict[str, Any]:
+    if bool(spec) == bool(spec_path):
+        raise ToolError("Pass exactly one of `spec` or `spec_path`.")
+    if spec:
+        return spec
+    _local_only(ctx, "Reading a spec file")
+    p = _project_path(spec_path or "", verb="read")
+    if not p.is_file():
+        raise ToolError(f"No such file: {p}")
+    text = p.read_text(encoding="utf-8")
+    try:
+        data = json.loads(text) if p.suffix.lower() == ".json" else yaml.safe_load(text)
+    except (ValueError, yaml.YAMLError) as e:
+        raise ToolError(f"Couldn't parse {p}: {e}") from e
+    if not isinstance(data, dict):
+        raise ToolError(f"{p} must hold an object with 'name' and 'phases'.")
+    return data
+
+
+async def _checked_spec(api: StrobesAPI, spec: dict[str, Any]) -> tuple[dict[str, Any], list]:
+    """Validate server-side; refuse on errors, return (normalized spec, other issues)."""
+    res = (await api.graphql(Q.VALIDATE_SPEC, {"spec": spec},
+                             op="validateWorkflowTemplateSpec"))["validateWorkflowTemplateSpec"] or {}
+    issues = res.get("issues") or []
+    errors = [i for i in issues if i.get("level") == "error"]
+    if errors:
+        lines = "; ".join(f"{i.get('path') or '(spec)'}: {i.get('message')}" for i in errors[:15])
+        more = f" (+{len(errors) - 15} more)" if len(errors) > 15 else ""
+        raise ToolError(f"The workflow spec has {len(errors)} error(s): {lines}{more}. Fix "
+                        "them (validate_workflow_spec to re-check) and try again.")
+    normalized = {**spec, **(res.get("spec") or {})}
+    return normalized, [i for i in issues if i.get("level") != "error"]
+
+
+def _wf_summary(api: StrobesAPI, wf: dict[str, Any] | None) -> dict[str, Any]:
+    out = render.compact(render.snake_keys(wf or {}))
+    out["status"] = lower_or(out.get("status"))
+    for ph in out.get("phases") or []:
+        ph["status"] = lower_or(ph.get("status"))
+    return out
+
+
+def _outline(spec: dict[str, Any], chars: int) -> dict[str, Any]:
+    phases = []
+    for ph in spec.get("phases") or []:
+        tasks = [render.compact({
+            "key": t.get("key"), "title": t.get("title"), "agent_type": t.get("agent_type"),
+            "kind": t.get("kind") if t.get("kind") not in (None, "agent") else None,
+            "instructions": render.truncate(t.get("instructions") or "", chars),
+        }) for t in ph.get("tasks") or []]
+        phases.append(render.compact({
+            "key": ph.get("key"), "name": ph.get("name"), "gate_type": ph.get("gate_type"),
+            "failure_policy": ph.get("failure_policy"), "loop_config": ph.get("loop_config"),
+            "tasks": tasks}))
+    return render.compact({k: spec.get(k) for k in ("name", "description", "icon", "version",
+                                                    "required_variables")}
+                          | {"table_templates": [t.get("name") or t.get("template")
+                                                 for t in spec.get("table_templates") or []],
+                             "phases": phases})
+
+
+@tool(RO, "Workflow authoring catalog")
+async def workflow_authoring_catalog(ctx: Context) -> dict[str, Any]:
+    """What a workflow spec may reference: agent ids (with what each is for), gate
+    types, failure policies, built-in commands and Strobes actions, prebuilt shared
+    tables and column types. Read this before writing a spec."""
+    api = SESSION.api(ctx)
+    c = (await api.graphql(Q.AUTHORING_CATALOG, op="workflowAuthoringCatalog"))[
+        "workflowAuthoringCatalog"] or {}
+    if isinstance(c.get("table_templates"), list):
+        c["table_templates"] = [{"id": t.get("id"), "name": t.get("name"),
+                                 "description": render.truncate(t.get("description") or "", 200),
+                                 "columns": [col.get("name") for col in t.get("columns") or []]}
+                                for t in c["table_templates"]]
+    c["spec_shape"] = (
+        "{name, description, icon, required_variables: ['target'], table_templates: "
+        "[{template: <prebuilt id>} | {name, columns: {col: {type}}}], phases: [{key, name, "
+        "gate_type, failure_policy, loop_config: {}, tasks: [{key, title, instructions, "
+        "agent_type, kind: 'agent'|'command'|'strobes_task', model_tier: 'lite'|'standard'"
+        "|'deep', prerequisites: [task keys]}]}]}. Phases run in order; a phase's tasks run "
+        "in parallel unless prerequisites say otherwise. {variable} placeholders are filled "
+        "from the workflow's variables.")
+    return c
+
+
+@tool(RO, "Export a workflow template's spec")
+async def export_workflow_template(
+    ctx: Context,
+    template_slug: Annotated[str, Field(description="Slug from list_workflow_templates.")],
+    save_to: Annotated[Optional[str], Field(description=(
+        "Write the full spec to this local .yaml / .json file (then edit it and pass it "
+        "back as spec_path). Local (stdio) server only."))] = None,
+    full: Annotated[bool, Field(description=(
+        "Return the complete spec inline. Built-in templates can be hundreds of KB — "
+        "prefer save_to."))] = False,
+    instruction_chars: Annotated[int, Field(ge=0, le=5000, description=(
+        "In the outline, truncate each task's instructions to this many characters."))] = 300,
+) -> dict[str, Any]:
+    """A template's spec (built-in or custom), as a starting point for a new or
+    edited workflow. Returns an outline (phases, tasks, agents, short instructions)
+    unless `full`; `save_to` writes the full spec to a file."""
+    api = SESSION.api(ctx)
+    spec = (await api.graphql(Q.TEMPLATE_EXPORT, {"slug": template_slug},
+                              op="workflowTemplateExport"))["workflowTemplateExport"]
+    if not spec:
+        raise ToolError(f"Template {template_slug!r} not found — see list_workflow_templates.")
+    out: dict[str, Any] = {"template_slug": template_slug}
+    if save_to:
+        _local_only(ctx, "Writing a spec file")
+        p = _project_path(save_to, verb="write")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        text = (json.dumps(spec, indent=2, ensure_ascii=False) if p.suffix.lower() == ".json"
+                else yaml.safe_dump(spec, sort_keys=False, allow_unicode=True, width=100))
+        p.write_text(text, encoding="utf-8")
+        out["saved_to"] = str(p)
+        out["bytes"] = len(text.encode())
+    if full:
+        out["spec"] = spec
+    else:
+        out["outline"] = _outline(spec, instruction_chars)
+    out["next_step"] = ("Edit the spec, then validate_workflow_spec → save_workflow_template "
+                        "(reusable) or attach_workflow (run it in a workspace).")
+    return out
+
+
+@tool(RO, "Validate a workflow spec")
+async def validate_workflow_spec(ctx: Context, spec: SpecArg = None,
+                                 spec_path: SpecPathArg = None) -> dict[str, Any]:
+    """Check a workflow spec without saving or running anything: returns errors
+    (would not save / would misbehave), warnings, and gaps that were auto-fixed."""
+    api = SESSION.api(ctx)
+    raw = _load_spec(ctx, spec, spec_path)
+    res = (await api.graphql(Q.VALIDATE_SPEC, {"spec": raw},
+                             op="validateWorkflowTemplateSpec"))["validateWorkflowTemplateSpec"] or {}
+    issues = res.get("issues") or []
+    by: dict[str, list] = {"errors": [], "warnings": [], "fixed": []}
+    for i in issues:
+        key = {"error": "errors", "warning": "warnings"}.get(i.get("level"), "fixed")
+        by[key].append(render.compact({"path": i.get("path"), "message": i.get("message")}))
+    norm = res.get("spec") or {}
+    return render.compact({"valid": not by["errors"], **by,
+                           "phases": len(norm.get("phases") or []),
+                           "tasks": sum(len(p.get("tasks") or []) for p in norm.get("phases") or [])})
+
+
+@tool(RO, "List a workspace's workflows")
+async def list_workflows(ctx: Context, workspace_id: WorkspaceId = None) -> dict[str, Any]:
+    """Every workflow attached to a workspace (current and past), newest first."""
+    api = SESSION.api(ctx)
+    wfs = (await api.graphql(Q.WORKFLOWS, {"ws": _ws(ctx, workspace_id)},
+                             op="workspaceWorkflows"))["workspaceWorkflows"] or []
+    rows = [_wf_summary(api, w) for w in wfs]
+    for r in rows:
+        r["phases"] = len(r.get("phases") or [])
+    return {"workflows": rows, "count": len(rows)}
+
+
+@tool(WRITE, "Save a reusable workflow template")
+async def save_workflow_template(
+    ctx: Context,
+    spec: SpecArg = None,
+    spec_path: SpecPathArg = None,
+    from_workspace: Annotated[bool, Field(description=(
+        "Instead of a spec: save the workflow currently attached to `workspace_id` "
+        "as a template."))] = False,
+    workspace_id: WorkspaceId = None,
+    name: Annotated[Optional[str], Field(description=(
+        "Template name (overrides the spec's; required with from_workspace)."))] = None,
+    description: Annotated[Optional[str], Field(description="Template description.")] = None,
+    icon: Annotated[Optional[str], Field(description="Icon name, e.g. 'globe', 'shield'.")] = None,
+    overwrite_slug: Annotated[Optional[str], Field(description=(
+        "Update this existing custom template (custom:<slug>) in place, bumping its "
+        "version, instead of creating a new one."))] = None,
+) -> dict[str, Any]:
+    """Save a reusable, org-wide custom workflow template, from a spec (validated
+    first) or from a workspace's current workflow. It then shows up in
+    list_workflow_templates as `custom:<slug>` for start_workflow / attach_workflow."""
+    api = SESSION.api(ctx)
+    if from_workspace:
+        if spec or spec_path:
+            raise ToolError("Pass a spec or from_workspace=true, not both.")
+        if not name:
+            raise ToolError("from_workspace needs a template `name`.")
+        p = (await api.graphql(Q.SAVE_AS_TEMPLATE, {
+            "ws": _ws(ctx, workspace_id), "name": name, "description": description,
+            "icon": icon, "overwrite": overwrite_slug}, op="saveWorkflowAsTemplate"))[
+            "saveWorkflowAsTemplate"] or {}
+        slug, notes = p.get("templateSlug"), []
+    else:
+        clean, notes = await _checked_spec(api, _load_spec(ctx, spec, spec_path))
+        p = (await api.graphql(Q.IMPORT_TEMPLATE, {
+            "name": name or clean.get("name"), "phases": clean.get("phases"),
+            "description": description if description is not None else clean.get("description"),
+            "icon": icon or clean.get("icon"),
+            "requiredVariables": clean.get("required_variables"),
+            "tables": clean.get("table_templates") or None, "overwrite": overwrite_slug},
+            op="importWorkflowTemplate"))["importWorkflowTemplate"] or {}
+        slug = p.get("templateSlug")
+    if slug and not slug.startswith("custom:"):
+        slug = f"custom:{slug}"
+    out: dict[str, Any] = {"ok": bool(slug), "template_slug": slug,
+                           "next_step": "start_workflow (new workspace) or attach_workflow "
+                                        "(existing workspace) with this slug."}
+    if notes:
+        out["validation_notes"] = notes[:20]
+    return out
+
+
+@tool(WRITE, "Attach a workflow to a workspace")
+async def attach_workflow(
+    ctx: Context,
+    template_slug: Annotated[Optional[str], Field(description=(
+        "Attach this template (built-in or custom:...). Or pass spec / spec_path for a "
+        "one-off custom workflow."))] = None,
+    spec: SpecArg = None,
+    spec_path: SpecPathArg = None,
+    variables: Annotated[Optional[dict[str, Any]], Field(description=(
+        "Values for the template's required variables, e.g. {\"target\": \"https://app.example.com\"}."))] = None,
+    workspace_id: WorkspaceId = None,
+    name: Annotated[Optional[str], Field(description="Name for a custom workflow (defaults to the spec's).")] = None,
+) -> dict[str, Any]:
+    """Attach a workflow (a template, or a one-off spec) to an existing workspace.
+    A workspace can run several workflows at once, so this adds one — use
+    detach_workflow to remove an old one. If the workspace is active it starts
+    right away and consumes AI credits; follow it with wait_for_workflow(workflow_id=...)."""
+    api = SESSION.api(ctx)
+    ws = _ws(ctx, workspace_id)
+    if template_slug and (spec or spec_path):
+        raise ToolError("Pass template_slug or a spec, not both.")
+    notes: list = []
+    if template_slug:
+        p = (await api.graphql(Q.ATTACH_TEMPLATE, {"ws": ws, "slug": template_slug,
+                                                   "vars": variables or {}},
+                               op="attachWorkflowTemplate"))["attachWorkflowTemplate"] or {}
+    else:
+        clean, notes = await _checked_spec(api, _load_spec(ctx, spec, spec_path))
+        missing = [v for v in clean.get("required_variables") or [] if v not in (variables or {})]
+        if missing:
+            raise ToolError(f"Missing variables for this workflow: {', '.join(missing)}.")
+        p = (await api.graphql(Q.CREATE_CUSTOM_WORKFLOW, {
+            "ws": ws, "name": name or clean.get("name") or "Custom workflow",
+            "phases": clean.get("phases"), "vars": variables or {},
+            "tables": clean.get("table_templates") or None},
+            op="createCustomWorkflow"))["createCustomWorkflow"] or {}
+    out = _wf_summary(api, p.get("workflow"))
+    out["workspace_id"] = ws
+    out["web_url"] = api.profile.app_url(f"ai/workspaces/{ws}")
+    out["next_step"] = (f"Running — wait_for_workflow(workflow_id='{out.get('workflow_id')}') "
+                        "to follow it." if out.get("status") == "running"
+                        else "Attached; it starts when the workspace is active "
+                             "(activate_workspace).")
+    if notes:
+        out["validation_notes"] = notes[:20]
+    return out
+
+
+@tool(DESTRUCTIVE, "Replace a workspace workflow's phases")
+async def edit_workflow(
+    ctx: Context,
+    spec: SpecArg = None,
+    spec_path: SpecPathArg = None,
+    variables: Annotated[Optional[dict[str, Any]], Field(description="New variable values (optional).")] = None,
+    workspace_id: WorkspaceId = None,
+    workflow_id: Annotated[Optional[str], Field(description="A specific workflow (default: latest).")] = None,
+) -> dict[str, Any]:
+    """Rebuild a workspace's workflow from a new spec. Not allowed while it's
+    running (pause or cancel it first). It comes back under a NEW workflow_id;
+    completed phase history is dropped, task records stay."""
+    api = SESSION.api(ctx)
+    clean, notes = await _checked_spec(api, _load_spec(ctx, spec, spec_path))
+    p = (await api.graphql(Q.EDIT_CUSTOM_WORKFLOW, {
+        "ws": _ws(ctx, workspace_id), "wf": workflow_id, "name": clean.get("name"),
+        "phases": clean.get("phases"), "vars": variables,
+        "tables": clean.get("table_templates") or None},
+        op="editCustomWorkflow"))["editCustomWorkflow"] or {}
+    out = _wf_summary(api, p.get("workflow"))
+    new_id = out.get("workflow_id")
+    if workflow_id and new_id and new_id != workflow_id:
+        out["replaces_workflow_id"] = workflow_id
+    start = {"paused": "resume", "pending": "restart"}.get(out.get("status") or "")
+    out["next_step"] = (f"Rebuilt as workflow {new_id} (use this id from now on). "
+                        + (f"control_workflow(action='{start}', workflow_id='{new_id}') to run it."
+                           if start else "wait_for_workflow to follow it."))
+    if notes:
+        out["validation_notes"] = notes[:20]
+    return out
+
+
+@tool(WRITE, "Set a phase's loop")
+async def set_phase_loop(
+    ctx: Context,
+    phase_key: Annotated[str, Field(description="phase_key from get_workflow.")],
+    loop_config: Annotated[dict[str, Any], Field(description=(
+        "The phase's loop_config (same shape as in a spec), or {} to stop looping."))],
+    workspace_id: WorkspaceId = None,
+    workflow_id: Annotated[Optional[str], Field(description="A specific workflow (default: latest).")] = None,
+) -> dict[str, Any]:
+    """Change or clear the loop on one pending or running phase of a live workflow."""
+    api = SESSION.api(ctx)
+    p = (await api.graphql(Q.UPDATE_PHASE_LOOP, {
+        "ws": _ws(ctx, workspace_id), "wf": workflow_id, "phase": phase_key,
+        "loop": loop_config}, op="updatePhaseLoopConfig"))["updatePhaseLoopConfig"] or {}
+    return {"ok": bool(p.get("success")), "phase_key": phase_key}
+
+
+@tool(DESTRUCTIVE, "Detach a workflow")
+async def detach_workflow(
+    ctx: Context,
+    workspace_id: WorkspaceId = None,
+    workflow_id: Annotated[Optional[str], Field(description="A specific workflow (default: latest).")] = None,
+) -> dict[str, Any]:
+    """Cancel and remove the workflow attached to a workspace, so another can be
+    attached. Task records are kept for audit."""
+    api = SESSION.api(ctx)
+    p = (await api.graphql(Q.DETACH_WORKFLOW, {"ws": _ws(ctx, workspace_id), "wf": workflow_id},
+                           op="detachWorkflow"))["detachWorkflow"] or {}
+    return {"ok": bool(p.get("success")),
+            "next_step": "attach_workflow to attach a different one."}
+
+
+@tool(DESTRUCTIVE, "Delete a custom workflow template")
+async def delete_workflow_template(
+    ctx: Context,
+    template_slug: Annotated[str, Field(description="A custom:<slug> template (built-ins can't be deleted).")],
+) -> dict[str, Any]:
+    """Delete one of your organization's custom workflow templates."""
+    if not template_slug.startswith("custom:"):
+        raise ToolError("Only custom:<slug> templates can be deleted; built-in ones are read-only.")
+    api = SESSION.api(ctx)
+    p = (await api.graphql(Q.DELETE_TEMPLATE, {"slug": template_slug},
+                           op="deleteCustomWorkflowTemplate"))["deleteCustomWorkflowTemplate"] or {}
+    return {"ok": bool(p.get("success")), "template_slug": template_slug}
 
 
 # --------------------------------------------------------------------------
@@ -1309,6 +1680,26 @@ def run_workflow(target: str, template: str = "") -> str:
         "4. wait_for_workflow (until=phase_change) in a loop, giving me a one-line update "
         "per phase. If it returns needs_attention, stop and tell me what's needed.\n"
         "5. When it finishes: list_findings (critical/high first) and list_files for reports.")
+
+
+@mcp.prompt(title="Design a custom workflow")
+def design_workflow(goal: str, base_template: str = "") -> str:
+    """Write a new multi-phase workflow, save it as a template, optionally run it."""
+    base = (f"Start from template '{base_template}': export_workflow_template(save_to="
+            "'workflows/<name>.yaml') and edit that file." if base_template else
+            "Write the spec from scratch (or start from the closest list_workflow_templates "
+            "entry via export_workflow_template).")
+    return (
+        f"Design a Strobes workflow for: {goal}\n"
+        "1. workflow_authoring_catalog for valid agents, gate types, failure policies, "
+        "commands and tables.\n"
+        f"2. {base} Use {{target}}-style placeholders and list them in required_variables. "
+        "Keep phases focused; pick the specialist agent for each task.\n"
+        "3. validate_workflow_spec until there are no errors; show me the outline "
+        "(phases → tasks → agent) and the warnings.\n"
+        "4. After I approve: save_workflow_template. If I want to run it now, "
+        "create_workspace then attach_workflow with the variables (it consumes AI "
+        "credits — confirm first), and follow it with wait_for_workflow.")
 
 
 @mcp.prompt(title="Monitor a running workflow")

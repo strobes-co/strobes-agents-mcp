@@ -48,6 +48,16 @@ switches between signed-in organizations.
 update per phase; it returns early with `needs_attention` when a person is needed) →
 `get_workflow` for a full snapshot → `control_workflow(action=pause|resume|cancel|restart|restart_phase|advance)`.
 
+**Write a custom workflow**
+`workflow_authoring_catalog` (valid agents, gates, policies, tables) →
+`export_workflow_template(slug, save_to="workflows/<name>.yaml")` to start from an existing one
+(or write a spec from scratch) → edit → `validate_workflow_spec(spec_path=...)` until no errors →
+show the user the outline → `save_workflow_template(spec_path=...)` for a reusable `custom:` template
+and/or `attach_workflow(workspace_id, spec_path=... | template_slug=..., variables={...})` to run it.
+A workspace can run several workflows at once, so pass `workflow_id` when you follow or steer one.
+`edit_workflow` rebuilds a non-running workflow under a **new** workflow_id. Use `detach_workflow` /
+`delete_workflow_template` only when the user asks.
+
 **Status board** — `get_workspace` (stats), `list_tasks` (`by_status` counts),
 `get_workflow`, `list_approvals` (pending human approvals happen in the web app),
 `get_credit_usage`.
