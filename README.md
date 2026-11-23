@@ -127,9 +127,21 @@ Other commands: `strobes-agents-mcp status` checks who you are and tests the con
 | Tasks (agent work) | `create_task` (spin up, optionally wait), `wait_for_task`, `get_task`, `get_task_messages`, `list_tasks`, `cancel_task`, `retry_task` |
 | Outputs | `list_findings`, `list_assets`, `list_files`, `read_file`, `get_download_url`, `upload_file` |
 | Oversight | `list_approvals`, `get_credit_usage` |
-| Workflows | `list_workflow_templates`, `start_workflow`, `get_workflow`, `control_workflow` |
+| Workflows | `list_workflow_templates`, `start_workflow`, `get_workflow`, `wait_for_workflow` (live monitor), `control_workflow` (pause / resume / cancel / restart / restart a phase / advance a manual gate) |
 
-Prompts: `run_agent(target, goal)` and `summarize_workspace(workspace_id)`.
+Prompts (show up as slash commands / prompt pickers in most clients):
+
+| Prompt | What it does |
+|---|---|
+| `run_agent(target, goal)` | Pick an agent, run a task on a target, report back |
+| `run_workflow(target, template)` | Pick a template, launch it, follow it phase by phase |
+| `monitor_workflow(workspace_id)` | Live-follow a running workflow and flag what needs you |
+| `agent_status(workspace_id)` | Status board of running/queued work and pending approvals |
+| `triage_findings(workspace_id, min_severity)` | Review, de-duplicate and rank findings |
+| `investigate_task(task_id, workspace_id)` | Root-cause a failed or stalled task |
+| `collect_reports(workspace_id)` | Find, read and link the deliverables |
+| `summarize_workspace(workspace_id)` | Executive brief on a workspace |
+| `credit_report()` | Where AI credits are going |
 
 How the tools are designed:
 
@@ -138,6 +150,9 @@ How the tools are designed:
 - **Default workspace.** `workspace_id` defaults to the workspace you picked at sign-in.
 - **Waiting.** `create_task(wait_seconds=…)` and `wait_for_task` stream **progress
   notifications** while the agent works, then return the agent's final answer.
+  `wait_for_workflow` does the same for workflows: it returns a timeline of phase and
+  task changes, and comes back early when a person is needed (input request, manual
+  gate, paused, blocked).
 - **Compact transcripts.** Agent transcripts drop the model's reasoning blocks by default.
   A single message can be 100 KB, mostly reasoning, and you can still see it with
   `include_thinking=true`.

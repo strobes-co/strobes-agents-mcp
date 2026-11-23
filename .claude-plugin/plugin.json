@@ -1,6 +1,6 @@
 {
   "name": "strobes-agents-mcp",
-  "version": "0.2.0",
+  "version": "1.1.0",
   "description": "Drive Strobes AI agents from Claude Code: browser sign-in, spin up / stop agent tasks and follow them to a result, read findings & files, run multi-phase workflows.",
   "author": { "name": "Strobes", "url": "https://strobes.co" },
   "homepage": "https://github.com/strobes-co/strobes-agents-mcp",
