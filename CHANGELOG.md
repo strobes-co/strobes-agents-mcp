@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.0
+- **Workflow authoring**: `workflow_authoring_catalog`, `export_workflow_template` (outline, or
+  the full spec saved to a local YAML/JSON file), `validate_workflow_spec`,
+  `save_workflow_template` (from a spec or a workspace's workflow), `attach_workflow` (a template
+  or a one-off spec), `edit_workflow`, `set_phase_loop`, `detach_workflow`,
+  `delete_workflow_template`, `list_workflows`. Specs are validated on the server before any write.
+- New prompt: `design_workflow`.
+- Requires the Strobes backend to expose these operations (and `restartWorkflow` /
+  `advanceWorkflowPhase`, used by `control_workflow`) on the public GraphQL API for API keys.
+
 ## 1.1.0
 - **Live workflow monitoring**: `wait_for_workflow` polls a running workflow with progress
   notifications and returns a timeline of phase/task changes; it returns early when a

@@ -127,7 +127,8 @@ Other commands: `strobes-agents-mcp status` checks who you are and tests the con
 | Tasks (agent work) | `create_task` (spin up, optionally wait), `wait_for_task`, `get_task`, `get_task_messages`, `list_tasks`, `cancel_task`, `retry_task` |
 | Outputs | `list_findings`, `list_assets`, `list_files`, `read_file`, `get_download_url`, `upload_file` |
 | Oversight | `list_approvals`, `get_credit_usage` |
-| Workflows | `list_workflow_templates`, `start_workflow`, `get_workflow`, `wait_for_workflow` (live monitor), `control_workflow` (pause / resume / cancel / restart / restart a phase / advance a manual gate) |
+| Workflows | `list_workflow_templates`, `start_workflow`, `list_workflows`, `get_workflow`, `wait_for_workflow` (live monitor), `control_workflow` (pause / resume / cancel / restart / restart a phase / advance a manual gate) |
+| Workflow authoring | `workflow_authoring_catalog`, `export_workflow_template`, `validate_workflow_spec`, `save_workflow_template`, `attach_workflow`, `edit_workflow`, `set_phase_loop`, `detach_workflow`, `delete_workflow_template` |
 
 Prompts (show up as slash commands / prompt pickers in most clients):
 
@@ -135,6 +136,7 @@ Prompts (show up as slash commands / prompt pickers in most clients):
 |---|---|
 | `run_agent(target, goal)` | Pick an agent, run a task on a target, report back |
 | `run_workflow(target, template)` | Pick a template, launch it, follow it phase by phase |
+| `design_workflow(goal, base_template)` | Write a custom workflow, validate it, save it as a template, optionally run it |
 | `monitor_workflow(workspace_id)` | Live-follow a running workflow and flag what needs you |
 | `agent_status(workspace_id)` | Status board of running/queued work and pending approvals |
 | `triage_findings(workspace_id, min_severity)` | Review, de-duplicate and rank findings |
@@ -153,6 +155,14 @@ How the tools are designed:
   `wait_for_workflow` does the same for workflows: it returns a timeline of phase and
   task changes, and comes back early when a person is needed (input request, manual
   gate, paused, blocked).
+- **Writing workflows.** A spec is the same portable shape the web app exports as YAML
+  (`{name, required_variables, phases: [{key, name, tasks: [{title, instructions,
+  agent_type}]}]}`). Built-in templates can be hundreds of KB, so
+  `export_workflow_template(save_to="workflows/x.yaml")` writes the file and returns only an
+  outline. You edit the file, then pass it back as `spec_path` to `validate_workflow_spec`,
+  `save_workflow_template` (an org-wide `custom:` template) or `attach_workflow` (run it in a
+  workspace). Every write is validated on the server first, and an invalid spec is refused
+  with its errors. Spec files must be under the project folder (or `STROBES_MCP_UPLOAD_ROOTS`).
 - **Compact transcripts.** Agent transcripts drop the model's reasoning blocks by default.
   A single message can be 100 KB, mostly reasoning, and you can still see it with
   `include_thinking=true`.

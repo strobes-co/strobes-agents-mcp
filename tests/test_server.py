@@ -398,3 +398,86 @@ async def test_control_workflow_restart_phase_needs_key(signed_in):
         res, out = await call("control_workflow", action="restart_phase", phase_key="exploit",
                               cascade=True)
     assert out["ok"] and seen["scope"] == "cascade" and seen["phase"] == "exploit"
+
+
+BAD_SPEC = {"name": "x", "phases": [{"key": "a", "tasks": [{"title": "t", "agent_type": "nope"}]}]}
+GOOD_SPEC = {"name": "Mine", "required_variables": ["target"], "phases": [
+    {"key": "a", "name": "A", "tasks": [{"key": "t", "title": "Hi {target}",
+                                         "instructions": "x", "agent_type": "web_pentest_agent"}]}]}
+
+
+def _validate(body):
+    spec = body["variables"]["spec"]
+    bad = any(t.get("agent_type") == "nope" for p in spec["phases"] for t in p["tasks"])
+    issues = [{"level": "error", "path": "phases[0].tasks[0].agent_type",
+               "message": "Unknown agent 'nope'."}] if bad else []
+    return {"data": {"validateWorkflowTemplateSpec": {"spec": spec, "issues": issues}}}
+
+
+async def test_save_template_refuses_invalid_spec(signed_in):
+    with respx.mock:
+        route = respx.post(GQL).mock(side_effect=gql_router({
+            "validateWorkflowTemplateSpec": _validate,
+            "importWorkflowTemplate": {"data": {"importWorkflowTemplate": {"templateSlug": "x"}}}}))
+        res, text = await call("save_workflow_template", spec=BAD_SPEC)
+    assert res.isError and "Unknown agent" in text
+    assert all("importWorkflowTemplate" not in json.loads(c.request.content)["query"]
+               for c in route.calls)
+
+
+async def test_save_template_and_attach_custom_spec(signed_in):
+    seen = {}
+    def imp(body):
+        seen["import"] = body["variables"]
+        return {"data": {"importWorkflowTemplate": {"templateSlug": "mine"}}}
+    def create(body):
+        seen["create"] = body["variables"]
+        return {"data": {"createCustomWorkflow": {"workflow": {
+            "workflowId": "w1", "status": "RUNNING", "phases": []}}}}
+    with respx.mock:
+        respx.post(GQL).mock(side_effect=gql_router({
+            "validateWorkflowTemplateSpec": _validate, "importWorkflowTemplate": imp,
+            "createCustomWorkflow": create}))
+        _, out = await call("save_workflow_template", spec=GOOD_SPEC)
+        assert out["template_slug"] == "custom:mine"
+        assert seen["import"]["requiredVariables"] == ["target"]
+        res, text = await call("attach_workflow", spec=GOOD_SPEC)
+        assert res.isError and "target" in text  # required variable missing
+        _, out = await call("attach_workflow", spec=GOOD_SPEC, variables={"target": "a.io"})
+    assert out["status"] == "running" and "w1" in out["next_step"]
+    assert seen["create"]["vars"] == {"target": "a.io"} and seen["create"]["ws"] == WS
+
+
+async def test_edit_workflow_reports_new_id(signed_in):
+    with respx.mock:
+        respx.post(GQL).mock(side_effect=gql_router({
+            "validateWorkflowTemplateSpec": _validate,
+            "editCustomWorkflow": {"data": {"editCustomWorkflow": {"workflow": {
+                "workflowId": "new", "status": "PENDING"}}}}}))
+        _, out = await call("edit_workflow", spec=GOOD_SPEC, workflow_id="old")
+    assert out["replaces_workflow_id"] == "old"
+    assert "action='restart', workflow_id='new'" in out["next_step"]
+
+
+async def test_spec_file_roundtrip(signed_in, tmp_path, monkeypatch):
+    monkeypatch.setenv("STROBES_MCP_UPLOAD_ROOTS", str(tmp_path))
+    exported = {"name": "Hello", "required_variables": ["target"], "phases": GOOD_SPEC["phases"]}
+    with respx.mock:
+        respx.post(GQL).mock(side_effect=gql_router({
+            "workflowTemplateExport": {"data": {"workflowTemplateExport": exported}},
+            "validateWorkflowTemplateSpec": _validate}))
+        _, out = await call("export_workflow_template", template_slug="hello-world",
+                            save_to=str(tmp_path / "wf" / "hello.yaml"))
+        assert out["outline"]["phases"][0]["tasks"][0]["title"] == "Hi {target}"
+        _, v = await call("validate_workflow_spec", spec_path=out["saved_to"])
+        assert v == {"valid": True, "phases": 1, "tasks": 1}
+        res, text = await call("validate_workflow_spec", spec_path="/etc/hosts.yaml")
+        assert res.isError and "Refusing" in text
+        res, text = await call("validate_workflow_spec", spec=GOOD_SPEC,
+                               spec_path=out["saved_to"])
+        assert res.isError and "exactly one" in text
+
+
+async def test_delete_template_only_custom(signed_in):
+    res, text = await call("delete_workflow_template", template_slug="web-app-pentest-fast")
+    assert res.isError and "custom:" in text

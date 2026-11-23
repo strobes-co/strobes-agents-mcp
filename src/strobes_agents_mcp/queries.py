@@ -185,3 +185,87 @@ ADVANCE_WORKFLOW_PHASE = """
 mutation AdvanceWorkflowPhase($ws: UUID!, $wf: UUID) {
   advanceWorkflowPhase(workspaceId: $ws, workflowId: $wf) { success }
 }"""
+
+# ------------------------------------------------------------- workflow authoring
+WORKFLOW_SUMMARY_FIELDS = """
+    workflowId name templateSlug templateVersion status currentPhaseKey
+    totalTasks completedTasks startedAt completedAt createdAt
+    phases { phaseKey phaseName status }"""
+
+WORKFLOWS = f"""
+query WorkspaceWorkflows($ws: UUID!) {{
+  workspaceWorkflows(workspaceId: $ws) {{ {WORKFLOW_SUMMARY_FIELDS} }}
+}}"""
+
+AUTHORING_CATALOG = """
+query WorkflowAuthoringCatalog { workflowAuthoringCatalog }"""
+
+TEMPLATE_EXPORT = """
+query WorkflowTemplateExport($slug: String!) { workflowTemplateExport(slug: $slug) }"""
+
+VALIDATE_SPEC = """
+query ValidateWorkflowTemplateSpec($spec: GenericScalar!) {
+  validateWorkflowTemplateSpec(spec: $spec)
+}"""
+
+ATTACH_TEMPLATE = f"""
+mutation AttachWorkflowTemplate($ws: UUID!, $slug: String!, $vars: GenericScalar!) {{
+  attachWorkflowTemplate(workspaceId: $ws, templateSlug: $slug, variables: $vars) {{
+    workflow {{ {WORKFLOW_SUMMARY_FIELDS} }}
+  }}
+}}"""
+
+CREATE_CUSTOM_WORKFLOW = f"""
+mutation CreateCustomWorkflow($ws: UUID!, $name: String!, $phases: GenericScalar!,
+                              $vars: GenericScalar, $tables: GenericScalar) {{
+  createCustomWorkflow(workspaceId: $ws, name: $name, phases: $phases, variables: $vars,
+                       tables: $tables) {{
+    workflow {{ {WORKFLOW_SUMMARY_FIELDS} }}
+  }}
+}}"""
+
+EDIT_CUSTOM_WORKFLOW = f"""
+mutation EditCustomWorkflow($ws: UUID!, $wf: UUID, $name: String, $phases: GenericScalar!,
+                            $vars: GenericScalar, $tables: GenericScalar) {{
+  editCustomWorkflow(workspaceId: $ws, workflowId: $wf, name: $name, phases: $phases,
+                     variables: $vars, tables: $tables) {{
+    workflow {{ {WORKFLOW_SUMMARY_FIELDS} }}
+  }}
+}}"""
+
+DETACH_WORKFLOW = """
+mutation DetachWorkflow($ws: UUID!, $wf: UUID) {
+  detachWorkflow(workspaceId: $ws, workflowId: $wf) { success }
+}"""
+
+UPDATE_PHASE_LOOP = """
+mutation UpdatePhaseLoopConfig($ws: UUID!, $wf: UUID, $phase: String!, $loop: GenericScalar!) {
+  updatePhaseLoopConfig(workspaceId: $ws, workflowId: $wf, phaseKey: $phase, loopConfig: $loop) {
+    success
+  }
+}"""
+
+SAVE_AS_TEMPLATE = """
+mutation SaveWorkflowAsTemplate($ws: UUID!, $wf: UUID, $name: String!, $description: String,
+                                $icon: String, $overwrite: String) {
+  saveWorkflowAsTemplate(workspaceId: $ws, workflowId: $wf, name: $name,
+                         description: $description, icon: $icon, overwriteSlug: $overwrite) {
+    success templateSlug
+  }
+}"""
+
+IMPORT_TEMPLATE = """
+mutation ImportWorkflowTemplate($name: String!, $phases: GenericScalar!, $description: String,
+                                $icon: String, $requiredVariables: GenericScalar,
+                                $tables: GenericScalar, $overwrite: String) {
+  importWorkflowTemplate(name: $name, phases: $phases, description: $description, icon: $icon,
+                         requiredVariables: $requiredVariables, tableTemplates: $tables,
+                         overwriteSlug: $overwrite) {
+    templateSlug
+  }
+}"""
+
+DELETE_TEMPLATE = """
+mutation DeleteCustomWorkflowTemplate($slug: String!) {
+  deleteCustomWorkflowTemplate(templateSlug: $slug) { success }
+}"""
