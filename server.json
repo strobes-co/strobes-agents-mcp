@@ -3,14 +3,14 @@
   "name": "io.github.strobes-co/strobes-agents-mcp",
   "title": "Strobes AI Agents",
   "description": "Spin up Strobes AI security agents, follow them to a result, read findings & files, run workflows.",
-  "version": "0.2.0",
+  "version": "1.1.0",
   "websiteUrl": "https://strobes.co",
   "repository": { "url": "https://github.com/strobes-co/strobes-agents-mcp", "source": "github" },
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "strobes-agents-mcp",
-      "version": "0.2.0",
+      "version": "1.1.0",
       "transport": { "type": "stdio" },
       "environmentVariables": [
         { "name": "STROBES_URL", "description": "Tenant URL (optional — browser sign-in sets it)", "isRequired": false },

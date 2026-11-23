@@ -90,9 +90,17 @@ query WorkflowTemplates {
 WORKFLOW = """
 query WorkspaceWorkflow($ws: UUID!, $wf: UUID) {
   workspaceWorkflow(workspaceId: $ws, workflowId: $wf) {
-    workflowId templateSlug templateVersion status currentPhaseKey variables
-    totalTasks completedTasks startedAt completedAt createdAt
-    phases { phaseKey phaseName order status gateType failurePolicy startedAt completedAt }
+    workflowId name templateSlug templateVersion status currentPhaseKey variables
+    blockedReason awaitingInput totalTasks completedTasks startedAt completedAt createdAt
+    phases {
+      phaseKey phaseName stage order status gateType failurePolicy iterationCount
+      awaitingInput startedAt completedAt
+      tasks {
+        taskId taskTemplateKey title status executionKind startedAt completedAt
+        blockedReason errorMessage
+        awaitingInput { interruptId title message interruptType agentName requestedAt }
+      }
+    }
   }
 }"""
 
@@ -159,4 +167,21 @@ mutation ResumeWorkflow($ws: UUID!, $wf: UUID) {
 CANCEL_WORKFLOW = """
 mutation CancelWorkflow($ws: UUID!, $wf: UUID) {
   cancelWorkflow(workspaceId: $ws, workflowId: $wf) { success }
+}"""
+
+RESTART_WORKFLOW = """
+mutation RestartWorkflow($ws: UUID!, $wf: UUID) {
+  restartWorkflow(workspaceId: $ws, workflowId: $wf) { success }
+}"""
+
+RESTART_WORKFLOW_FROM_PHASE = """
+mutation RestartWorkflowFromPhase($ws: UUID!, $wf: UUID, $phase: String!, $scope: String) {
+  restartWorkflowFromPhase(workspaceId: $ws, workflowId: $wf, phaseKey: $phase, scope: $scope) {
+    success
+  }
+}"""
+
+ADVANCE_WORKFLOW_PHASE = """
+mutation AdvanceWorkflowPhase($ws: UUID!, $wf: UUID) {
+  advanceWorkflowPhase(workspaceId: $ws, workflowId: $wf) { success }
 }"""

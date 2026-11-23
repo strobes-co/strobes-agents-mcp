@@ -338,3 +338,63 @@ async def test_loopback_http_allows_session_tools(signed_in, monkeypatch):
     monkeypatch.setenv("STROBES_MCP_LOCAL_HTTP", "1")
     res, out = await call("strobes_use_profile", profile="default")
     assert not res.isError, out
+
+
+def _wf(status="running", phase="recon", tasks=None, total=2, done=0, gate="auto"):
+    return {"data": {"workspaceWorkflow": {
+        "workflowId": "44444444-4444-4444-4444-444444444444", "status": status,
+        "currentPhaseKey": phase, "totalTasks": total, "completedTasks": done,
+        "phases": [{"phaseKey": phase, "phaseName": phase.title(), "order": 1,
+                    "status": "RUNNING" if status == "running" else status.upper(),
+                    "gateType": gate, "tasks": tasks or []}]}}}
+
+
+async def test_prompts_catalog():
+    async with create_connected_server_and_client_session(server.mcp._mcp_server) as s:
+        names = {p.name for p in (await s.list_prompts()).prompts}
+    assert {"run_agent", "summarize_workspace", "run_workflow", "monitor_workflow",
+            "agent_status", "triage_findings", "investigate_task"} <= names
+
+
+async def test_get_workflow_flags_input_request(signed_in):
+    tasks = [{"taskId": TASK, "title": "Log in", "status": "RUNNING",
+              "awaitingInput": {"interruptType": "otp", "message": "Enter the OTP"}}]
+    with respx.mock:
+        respx.post(GQL).mock(side_effect=gql_router({"workspaceWorkflow": _wf(tasks=tasks)}))
+        res, out = await call("get_workflow")
+    assert not res.isError
+    assert out["needs_attention"][0]["kind"] == "input_request"
+    assert out["phases"][0]["tasks"][0]["status"] == "running"
+    assert out["progress"] == "0/2 tasks"
+
+
+async def test_wait_for_workflow_returns_on_phase_change(signed_in, monkeypatch):
+    async def no_sleep(_):
+        return None
+    monkeypatch.setattr(server, "_sleep", no_sleep)
+    snaps = iter([
+        _wf(tasks=[{"taskId": TASK, "title": "Recon", "status": "RUNNING"}]),
+        _wf(tasks=[{"taskId": TASK, "title": "Recon", "status": "COMPLETED"}], done=1),
+        _wf(phase="exploit", done=1),
+    ])
+    with respx.mock:
+        respx.post(GQL).mock(side_effect=gql_router({"workspaceWorkflow": lambda b: next(snaps)}))
+        res, out = await call("wait_for_workflow", poll_seconds=5)
+    assert not res.isError
+    assert out["returned_because"] == "phase_change"
+    assert any(e.get("status") == "running → completed" for e in out["events"])
+    assert any(e.get("phase") == "recon → exploit" for e in out["events"])
+
+
+async def test_control_workflow_restart_phase_needs_key(signed_in):
+    res, text = await call("control_workflow", action="restart_phase")
+    assert res.isError and "phase_key" in text
+    seen = {}
+    def ok(body):
+        seen.update(body["variables"])
+        return {"data": {"restartWorkflowFromPhase": {"success": True}}}
+    with respx.mock:
+        respx.post(GQL).mock(side_effect=gql_router({"restartWorkflowFromPhase": ok}))
+        res, out = await call("control_workflow", action="restart_phase", phase_key="exploit",
+                              cascade=True)
+    assert out["ok"] and seen["scope"] == "cascade" and seen["phase"] == "exploit"

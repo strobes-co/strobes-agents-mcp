@@ -1,6 +1,6 @@
 [project]
 name = "strobes-agents-mcp"
-version = "0.2.0"
+version = "1.1.0"
 description = "MCP server for Strobes AI agents: spin up & stop agent tasks, follow their work, read findings/files, run workflows. Browser sign-in shared with the Strobes CLI."
 readme = "README.md"
 requires-python = ">=3.10"

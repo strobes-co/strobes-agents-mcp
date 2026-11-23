@@ -44,7 +44,8 @@ agent to do something, `create_task` with plain-language instructions and an age
 id from `list_agents`; tasks run asynchronously in Strobes' cloud — use
 `wait_for_task` (or `get_task`) to follow progress and read the result. Outputs
 land in the workspace: `list_findings`, `list_assets`, `list_files`/`read_file`.
-For a multi-phase pipeline, `list_workflow_templates` then `start_workflow`.
+For a multi-phase pipeline, `list_workflow_templates` then `start_workflow`; follow it
+live with `wait_for_workflow` (returns on phase changes and when a person is needed).
 
 `workspace_id` defaults to the workspace chosen at sign-in, when there is one.
 Agent runs consume AI credits — don't create duplicate tasks, and don't retry a
@@ -1051,43 +1052,219 @@ async def start_workflow(
     return w
 
 
+WORKFLOW_TERMINAL = {"completed", "failed", "cancelled"}
+# states where the workflow will not move on by itself
+WORKFLOW_NEEDS_HUMAN = {"paused", "blocked"}
+
+
+async def _fetch_workflow(api: StrobesAPI, ws: str, workflow_id: str | None) -> dict[str, Any] | None:
+    return (await api.graphql(Q.WORKFLOW, {"ws": ws, "wf": workflow_id},
+                              op="workspaceWorkflow"))["workspaceWorkflow"]
+
+
+def _workflow_view(wf: dict[str, Any], *, tasks: bool = True) -> dict[str, Any]:
+    """Compact workflow status, plus a `needs_attention` list of everything a
+    person has to act on (input requests, manual gates, blocked/failed tasks)."""
+    out = render.compact(render.snake_keys(wf))
+    out["status"] = lower_or(out.get("status"))
+    attention: list[dict[str, Any]] = []
+    if out.get("blocked_reason"):
+        attention.append({"kind": "workflow_blocked", "reason": out["blocked_reason"]})
+    for ph in out.get("phases") or []:
+        ph["status"] = lower_or(ph.get("status"))
+        rows = ph.pop("tasks", None) or []
+        counts: dict[str, int] = {}
+        for t in rows:
+            t["status"] = lower_or(t.get("status"))
+            counts[t["status"] or "?"] = counts.get(t["status"] or "?", 0) + 1
+            where = {"phase": ph.get("phase_key"), "task_id": t.get("task_id"),
+                     "title": t.get("title")}
+            if t.get("awaiting_input"):
+                ai = t["awaiting_input"]
+                attention.append({"kind": "input_request", **where,
+                                  "type": ai.get("interrupt_type"),
+                                  "question": render.truncate(
+                                      ai.get("message") or ai.get("title") or "", 300)})
+            elif t.get("blocked_reason"):
+                attention.append({"kind": "task_blocked", **where,
+                                  "reason": t["blocked_reason"]})
+            if t["status"] == "failed":
+                attention.append({"kind": "task_failed", **where,
+                                  "error": render.truncate(t.get("error_message") or "", 300)})
+        if counts:
+            ph["task_counts"] = counts
+        if tasks and rows:
+            ph["tasks"] = [render.compact({
+                "task_id": t.get("task_id"), "title": t.get("title"), "status": t.get("status"),
+                "kind": t.get("execution_kind") if t.get("execution_kind") != "agent" else None,
+                "started_at": t.get("started_at"), "completed_at": t.get("completed_at"),
+            }) for t in rows]
+        if (ph.get("status") == "running" and lower_or(ph.get("gate_type")) == "manual"
+                and counts and all(k in render.TERMINAL_TASK for k in counts)):
+            attention.append({"kind": "manual_gate", "phase": ph.get("phase_key"),
+                              "action": "control_workflow(action='advance') to continue"})
+    if out.get("total_tasks"):
+        out["progress"] = f"{out.get('completed_tasks', 0)}/{out['total_tasks']} tasks"
+    if attention:
+        out["needs_attention"] = attention
+    return out
+
+
+def _workflow_hint(out: dict[str, Any]) -> str | None:
+    st = out.get("status")
+    if st in WORKFLOW_TERMINAL:
+        return ("Finished — list_findings and list_files for results."
+                if st == "completed" else
+                "Stopped — check needs_attention / get_task on failed tasks; "
+                "control_workflow(action='restart' or 'restart_phase') to re-run.")
+    if out.get("needs_attention"):
+        return ("Waiting on a person — answer input requests in the web app "
+                "(Approvals → Input Requests), or advance a manual gate with control_workflow.")
+    if st == "paused":
+        return "Paused — control_workflow(action='resume') to continue."
+    return "Running — wait_for_workflow to follow it; get_task_messages on a task_id for detail."
+
+
 @tool(RO, "Get workflow progress")
 async def get_workflow(
     ctx: Context,
     workspace_id: WorkspaceId = None,
     workflow_id: Annotated[Optional[str], Field(description="A specific workflow (default: latest).")] = None,
+    include_tasks: Annotated[bool, Field(description="List each phase's tasks (ids, titles, status).")] = True,
 ) -> dict[str, Any]:
-    """Status of a workspace's workflow: overall state, current phase, every phase's
-    status and task progress."""
+    """Snapshot of a workspace's workflow: overall state and progress, current
+    phase, every phase with its tasks, and `needs_attention` (input requests,
+    manual gates, blocked or failed tasks). Use `wait_for_workflow` to follow it live."""
     api = SESSION.api(ctx)
-    wf = (await api.graphql(Q.WORKFLOW, {"ws": _ws(ctx, workspace_id), "wf": workflow_id},
-                            op="workspaceWorkflow"))["workspaceWorkflow"]
+    wf = await _fetch_workflow(api, _ws(ctx, workspace_id), workflow_id)
     if not wf:
         return {"workflow": None, "note": "This workspace has no workflow."}
-    out = render.compact(render.snake_keys(wf))
-    for k in ("status", "current_phase_key"):
-        out[k] = lower_or(out.get(k)) if k == "status" else out.get(k)
-    for ph in out.get("phases") or []:
-        ph["status"] = lower_or(ph.get("status"))
+    out = _workflow_view(wf, tasks=include_tasks)
+    out["next_step"] = _workflow_hint(out)
     return out
 
 
-@tool(DESTRUCTIVE, "Pause / resume / cancel a workflow")
-async def control_workflow(
+def _task_states(view: dict[str, Any]) -> dict[str, tuple[str, str]]:
+    return {t["task_id"]: (t.get("title") or t["task_id"], t.get("status") or "?")
+            for ph in view.get("phases") or [] for t in ph.get("tasks") or [] if t.get("task_id")}
+
+
+@tool(RO, "Monitor a running workflow")
+async def wait_for_workflow(
     ctx: Context,
-    action: Annotated[Literal["pause", "resume", "cancel"], Field(description=(
-        "pause: hold after running tasks; resume: continue; cancel: stop for good."))],
     workspace_id: WorkspaceId = None,
     workflow_id: Annotated[Optional[str], Field(description="A specific workflow (default: latest).")] = None,
+    until: Annotated[Literal["finished", "phase_change", "any_change"], Field(description=(
+        "Return when the workflow finishes, when the current phase changes, or on any "
+        "task/phase status change. It always returns early if a person is needed."))] = "phase_change",
+    timeout_seconds: Annotated[int, Field(ge=5, le=1800, description=(
+        "Give up waiting after this long (the workflow keeps running)."))] = 600,
+    poll_seconds: Annotated[int, Field(ge=5, le=300)] = 15,
 ) -> dict[str, Any]:
-    """Pause, resume or cancel a workspace's workflow."""
+    """Follow a running workflow live: polls it, reports progress (tasks done /
+    total, current phase), and returns a timeline of what changed — phase
+    transitions and task starts/finishes — plus the latest snapshot. Returns
+    early when the workflow needs a person (input request, manual gate, paused,
+    blocked). Call again to keep watching."""
     api = SESSION.api(ctx)
-    doc, field = {"pause": (Q.PAUSE_WORKFLOW, "pauseWorkflow"),
-                  "resume": (Q.RESUME_WORKFLOW, "resumeWorkflow"),
-                  "cancel": (Q.CANCEL_WORKFLOW, "cancelWorkflow")}[action]
-    p = (await api.graphql(doc, {"ws": _ws(ctx, workspace_id), "wf": workflow_id},
-                           op=field))[field] or {}
-    return {"ok": bool(p.get("success")), "action": action}
+    ws = _ws(ctx, workspace_id)
+    start = time.monotonic()
+    events: list[dict[str, Any]] = []
+    prev: dict[str, Any] | None = None
+    reason = "timeout"
+    while True:
+        wf = await _fetch_workflow(api, ws, workflow_id)
+        if not wf:
+            return {"workflow": None, "note": "This workspace has no workflow."}
+        view = _workflow_view(wf)
+        workflow_id = workflow_id or view.get("workflow_id")  # pin it across polls
+        elapsed = int(time.monotonic() - start)
+        changed = False
+        if prev is not None:
+            stamp = {"at_seconds": elapsed}
+            if view.get("status") != prev.get("status"):
+                events.append({**stamp, "workflow": f"{prev.get('status')} → {view.get('status')}"})
+                changed = True
+            if view.get("current_phase_key") != prev.get("current_phase_key"):
+                events.append({**stamp, "phase": f"{prev.get('current_phase_key')} → "
+                                                 f"{view.get('current_phase_key')}"})
+                changed = True
+            old = _task_states(prev)
+            for tid, (title, st) in _task_states(view).items():
+                if old.get(tid, (None, None))[1] != st:
+                    events.append({**stamp, "task_id": tid, "title": title,
+                                   "status": f"{old[tid][1]} → {st}" if tid in old else st})
+                    changed = True
+        phase_moved = prev is not None and (
+            view.get("current_phase_key") != prev.get("current_phase_key"))
+        if view.get("status") in WORKFLOW_TERMINAL:
+            reason = "finished"
+        elif view.get("needs_attention") or view.get("status") in WORKFLOW_NEEDS_HUMAN:
+            reason = "needs_attention"
+        elif until == "phase_change" and phase_moved:
+            reason = "phase_change"
+        elif until == "any_change" and changed:
+            reason = "changed"
+        elif elapsed >= timeout_seconds:
+            reason = "timeout"
+        else:
+            reason = ""
+        if reason:
+            break
+        prev = view
+        total = view.get("total_tasks") or 0
+        await ctx.report_progress(view.get("completed_tasks") or 0, total or None,
+                                  f"{view.get('status')} · phase {view.get('current_phase_key')} · "
+                                  f"{view.get('progress', '')} ({elapsed}s)")
+        await _sleep(min(poll_seconds, max(1, timeout_seconds - elapsed)))
+    view["returned_because"] = reason
+    view["waited_seconds"] = int(time.monotonic() - start)
+    if events:
+        view["events"] = events[-100:]
+    view["next_step"] = _workflow_hint(view)
+    return view
+
+
+_WF_CONTROL = {
+    "pause": (Q.PAUSE_WORKFLOW, "pauseWorkflow"),
+    "resume": (Q.RESUME_WORKFLOW, "resumeWorkflow"),
+    "cancel": (Q.CANCEL_WORKFLOW, "cancelWorkflow"),
+    "restart": (Q.RESTART_WORKFLOW, "restartWorkflow"),
+    "restart_phase": (Q.RESTART_WORKFLOW_FROM_PHASE, "restartWorkflowFromPhase"),
+    "advance": (Q.ADVANCE_WORKFLOW_PHASE, "advanceWorkflowPhase"),
+}
+
+
+@tool(DESTRUCTIVE, "Pause / resume / cancel / restart a workflow")
+async def control_workflow(
+    ctx: Context,
+    action: Annotated[Literal["pause", "resume", "cancel", "restart", "restart_phase", "advance"],
+                      Field(description=(
+        "pause: hold after running tasks; resume: continue; cancel: stop for good; "
+        "restart: re-run a finished/failed/cancelled workflow from scratch (credits); "
+        "restart_phase: re-run one phase (needs phase_key; credits); "
+        "advance: move past a manual gate phase."))],
+    workspace_id: WorkspaceId = None,
+    workflow_id: Annotated[Optional[str], Field(description="A specific workflow (default: latest).")] = None,
+    phase_key: Annotated[Optional[str], Field(description=(
+        "For restart_phase: the phase_key from get_workflow."))] = None,
+    cascade: Annotated[bool, Field(description=(
+        "For restart_phase: also restart every later phase."))] = False,
+) -> dict[str, Any]:
+    """Steer a workspace's workflow: pause, resume, cancel, restart (whole or from
+    a phase), or advance past a manual gate."""
+    api = SESSION.api(ctx)
+    doc, field = _WF_CONTROL[action]
+    variables: dict[str, Any] = {"ws": _ws(ctx, workspace_id), "wf": workflow_id}
+    if action == "restart_phase":
+        if not phase_key:
+            raise ToolError("restart_phase needs phase_key (see get_workflow's phases).")
+        variables.update(phase=phase_key, scope="cascade" if cascade else "phase")
+    p = (await api.graphql(doc, variables, op=field))[field] or {}
+    out: dict[str, Any] = {"ok": bool(p.get("success")), "action": action}
+    if out["ok"] and action not in ("pause", "cancel"):
+        out["next_step"] = "Call wait_for_workflow to follow it."
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -1115,6 +1292,101 @@ def summarize_workspace(workspace_id: str) -> str:
         "for what ran (and get_task on any failed ones), list_findings (critical/high "
         "first), list_files for reports. Produce an executive summary, key findings "
         "with severity, open/failed work, and suggested next agent tasks.")
+
+
+@mcp.prompt(title="Run a multi-phase workflow")
+def run_workflow(target: str, template: str = "") -> str:
+    """Pick a workflow template, launch it on a target, and follow it."""
+    pick = (f"Use the template whose slug or name matches '{template}'." if template
+            else "Pick the template that best fits the target and tell me which you chose.")
+    return (
+        f"Run a Strobes workflow against {target}.\n"
+        "1. strobes_whoami (sign in with strobes_login if needed).\n"
+        f"2. list_workflow_templates. {pick} Fill its required_variables from the "
+        "target; ask me for anything you can't infer.\n"
+        "3. Confirm the template and variables with me (it consumes AI credits), then "
+        "start_workflow.\n"
+        "4. wait_for_workflow (until=phase_change) in a loop, giving me a one-line update "
+        "per phase. If it returns needs_attention, stop and tell me what's needed.\n"
+        "5. When it finishes: list_findings (critical/high first) and list_files for reports.")
+
+
+@mcp.prompt(title="Monitor a running workflow")
+def monitor_workflow(workspace_id: str = "") -> str:
+    """Live-follow a workflow: phase updates, blockers, and a wrap-up when done."""
+    ws = f"workspace {workspace_id}" if workspace_id else "the default workspace"
+    return (
+        f"Monitor the workflow in {ws}.\n"
+        "1. get_workflow for the current snapshot: status, progress, current phase, "
+        "needs_attention.\n"
+        "2. Loop wait_for_workflow (until=phase_change). After each return, report in one "
+        "or two lines: what changed (its events), progress, current phase.\n"
+        "3. If returned_because is needs_attention, explain exactly what's needed (input "
+        "request, manual gate, failed task — get_task / get_task_messages on it) and ask me "
+        "before control_workflow or retry_task.\n"
+        "4. When it finishes, summarize: phases run, list_findings by severity, list_files "
+        "for reports, and anything that failed.")
+
+
+@mcp.prompt(title="What are my agents doing?")
+def agent_status(workspace_id: str = "") -> str:
+    """Status of running/queued tasks and workflows, and what needs you."""
+    ws = f"workspace {workspace_id}" if workspace_id else "my active workspaces"
+    return (
+        f"Give me a status board for {ws}.\n"
+        "- If no workspace was given: list_workspaces (status=active).\n"
+        "- For each workspace: list_tasks (running and queued), get_workflow if it has "
+        "one, and get_task on running tasks for their latest_update.\n"
+        "- list_approvals for anything waiting on me.\n"
+        "Output a compact table: workspace, task/phase, agent, status, latest update; then "
+        "a 'needs you' list. Don't start, cancel or retry anything.")
+
+
+@mcp.prompt(title="Triage workspace findings")
+def triage_findings(workspace_id: str = "", min_severity: str = "high") -> str:
+    """Review and prioritise what agents found."""
+    ws = f"workspace {workspace_id}" if workspace_id else "the default workspace"
+    return (
+        f"Triage the findings in {ws}, {min_severity} severity and above first.\n"
+        "1. list_findings (filter by severity), then list_assets for affected assets.\n"
+        "2. For each finding: what it is, affected asset, evidence quality (read the "
+        "evidence files with list_files/read_file when referenced), likely false positive "
+        "or not, and the fix.\n"
+        "3. Group duplicates, rank by real-world risk, and suggest follow-up agent tasks "
+        "(e.g. validation) without creating them until I confirm.")
+
+
+@mcp.prompt(title="Investigate a failed task")
+def investigate_task(task_id: str, workspace_id: str = "") -> str:
+    """Find out why a task failed or stalled and what to do next."""
+    ws = f" in workspace {workspace_id}" if workspace_id else ""
+    return (
+        f"Investigate Strobes task {task_id}{ws}.\n"
+        "1. get_task for status and result.\n"
+        "2. get_task_messages (page back with older_offset if needed) to find where it went "
+        "wrong: tool errors, scope/auth problems, timeouts, credits.\n"
+        "3. Tell me the root cause and the fix: better instructions, missing credentials or "
+        "context (upload_file), a different agent, or a plain retry. Don't retry_task or "
+        "create a new task until I approve — and never retry a credit/budget failure.")
+
+
+@mcp.prompt(title="Pull the reports")
+def collect_reports(workspace_id: str = "") -> str:
+    """Find and read the reports and deliverables agents produced."""
+    ws = f"workspace {workspace_id}" if workspace_id else "the default workspace"
+    return (
+        f"Collect the deliverables from {ws}: list_files, then read_file the reports "
+        "(report/summary/findings documents first). Summarize each, and give me "
+        "get_download_url links for anything large or binary, plus a zip of the whole "
+        "workspace if I want everything.")
+
+
+@mcp.prompt(title="AI credit usage")
+def credit_report() -> str:
+    """Where AI credits are going."""
+    return ("get_credit_usage and summarize: total used vs. budget, the top workspaces "
+            "by spend, and anything running right now (list_tasks status=running on the top "
+            "workspaces) that will keep consuming credits.")
 
 
 def build(transport: str = "stdio") -> FastMCP:

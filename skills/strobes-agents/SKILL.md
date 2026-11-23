@@ -44,7 +44,9 @@ switches between signed-in organizations.
 
 **Run a workflow**
 `list_workflow_templates` → `start_workflow(template_slug, variables={"target": ...})` →
-`get_workflow(workspace_id)` for phase progress → `control_workflow(action=pause|resume|cancel)`.
+`wait_for_workflow(workspace_id, until="phase_change")` in a loop to follow it live (one-line
+update per phase; it returns early with `needs_attention` when a person is needed) →
+`get_workflow` for a full snapshot → `control_workflow(action=pause|resume|cancel|restart|restart_phase|advance)`.
 
 **Status board** — `get_workspace` (stats), `list_tasks` (`by_status` counts),
 `get_workflow`, `list_approvals` (pending human approvals happen in the web app),

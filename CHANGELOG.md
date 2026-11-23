@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.0
+- **Live workflow monitoring**: `wait_for_workflow` polls a running workflow with progress
+  notifications and returns a timeline of phase/task changes; it returns early when a
+  person is needed (input request, manual gate, paused, blocked).
+- `get_workflow` now lists each phase's tasks and a `needs_attention` list.
+- `control_workflow` adds `restart`, `restart_phase` (optionally cascading) and `advance`
+  (past a manual gate).
+- New prompts: `run_workflow`, `monitor_workflow`, `agent_status`, `triage_findings`,
+  `investigate_task`, `collect_reports`, `credit_report`.
+
 ## 0.2.0
 - **Browser sign-in** (`strobes-agents-mcp login` / `strobes_login` tool), the same device flow
   as `strobes login`; credentials are shared with the Strobes CLI's profile store.
